@@ -8,7 +8,7 @@
   - Flags non-local/domain principals in local groups (SID-based, machine SID baseline)
   - Findings + deterministic dedup
   - Output (main): currentrights_<HOSTNAME>_<TIMESTAMP>.csv
-  - Output (context/test file): context_<HOSTNAME>_<TIMESTAMP>.txt   (OS + gpresult)
+  - Output (context/test file): context_<HOSTNAME>_<TIMESTAMP>.txt   (OS context)
 
 .NOTES
   Read-only. Run as Administrator for best results (secedit export can be blocked otherwise).
@@ -20,8 +20,7 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$Delimiter = ',',     # set to ';' if you prefer Excel in DK environments
     [switch]$IncludeAllLocalGroups = $true,
-    [switch]$IncludeWellKnownGroups = $true,
-    [switch]$IncludeGpResultEvidence = $true
+    [switch]$IncludeWellKnownGroups = $true
 )
 
 Set-StrictMode -Version Latest
@@ -58,6 +57,17 @@ Add-ContextLine ("---")
 function Norm([string]$s) {
     if ([string]::IsNullOrWhiteSpace($s)) { return '' }
     return $s.Trim().ToLowerInvariant()
+}
+
+function New-NormSet {
+    param([string[]]$Values)
+    $set = New-Object 'System.Collections.Generic.HashSet[string]'
+    if ($Values) {
+        foreach ($val in $Values) {
+            $null = $set.Add((Norm $val))
+        }
+    }
+    return $set
 }
 
 function Try-TranslateToSid {
@@ -268,29 +278,6 @@ try {
 catch {
     Add-ContextLine ("OS/System context failed: {0}" -f $_.Exception.Message)
     Add-ContextLine ("---")
-}
-
-# ---------------------------
-# Context: gpresult -> context file only (NOT CSV)
-# ---------------------------
-if ($IncludeGpResultEvidence) {
-    try {
-        Add-ContextLine "## GPResult (Computer scope)"
-        $gp = & gpresult.exe /R /SCOPE COMPUTER 2>$null
-        $exit = $LASTEXITCODE
-
-        if ($exit -eq 0 -and $gp) {
-            Add-ContextLine ("gpresult ExitCode: {0}" -f $exit)
-            Add-ContextLine (($gp -join "`n"))
-        }
-        else {
-            Add-ContextLine ("gpresult failed or blocked. ExitCode={0}" -f $exit)
-        }
-        Add-ContextLine ("---")
-    } catch {
-        Add-ContextLine ("gpresult exception: {0}" -f $_.Exception.Message)
-        Add-ContextLine ("---")
-    }
 }
 
 # ---------------------------
@@ -528,8 +515,11 @@ try {
         Where-Object { $_.Category -eq 'UserRightAssignment' -and $_.RightId -eq 'SeDenyRemoteInteractiveLogonRight' -and $_.PrincipalResolved } |
         Select-Object -ExpandProperty PrincipalResolved -Unique
 
-    $allowGroupCovered = ($allowRdp | ForEach-Object { Norm $_ }) -contains $rduGroupResolvedNorm
-    $denyGroupCovered  = ($denyRdp  | ForEach-Object { Norm $_ }) -contains $rduGroupResolvedNorm
+    $allowSet = New-NormSet -Values $allowRdp
+    $denySet  = New-NormSet -Values $denyRdp
+
+    $allowGroupCovered = $allowSet.Contains($rduGroupResolvedNorm)
+    $denyGroupCovered  = $denySet.Contains($rduGroupResolvedNorm)
 
     Add-Row -Category 'CrossReference' -LocalGroup $rduLocalName -RightName $rightsMap['SeRemoteInteractiveLogonRight'] -RightId 'SeRemoteInteractiveLogonRight' `
         -PrincipalRaw $rduNt -PrincipalType 'Group' -Source 'CrossRefSummary' -Severity '' -FindingId '' `
@@ -541,8 +531,8 @@ try {
 
     foreach ($m in $rduMembers) {
         $mNorm = Norm $m
-        $isExplicitlyAllowed = (($allowRdp | ForEach-Object { Norm $_ }) -contains $mNorm)
-        $isExplicitlyDenied  = (($denyRdp  | ForEach-Object { Norm $_ }) -contains $mNorm)
+        $isExplicitlyAllowed = $allowSet.Contains($mNorm)
+        $isExplicitlyDenied  = $denySet.Contains($mNorm)
 
         $effectiveAllowed = ($allowGroupCovered -or $isExplicitlyAllowed) -and (-not ($denyGroupCovered -or $isExplicitlyDenied))
 
@@ -600,7 +590,7 @@ $rows |
     Export-Csv -LiteralPath $outPathMain -NoTypeInformation -Encoding UTF8 -Delimiter $Delimiter
 
 # ---------------------------
-# Write context file (OS + gpresult)
+# Write context file (OS context)
 # ---------------------------
 $contextLines | Set-Content -LiteralPath $outPathContext -Encoding UTF8
 
