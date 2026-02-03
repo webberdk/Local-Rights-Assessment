@@ -3,12 +3,11 @@
 .SYNOPSIS
   Local rights audit for hardening / GPO replacement:
   - Local group memberships (all groups) + explicit well-known high-risk groups (language independent)
-  - User Rights Assignments (Allow + Deny) via secedit USER_RIGHTS
+  - User Rights Assignments (Allow + Deny) via secedit USER_RIGHTS (uses TEMP file, deleted afterwards)
   - Cross-reference: Remote Desktop Users vs SeRemoteInteractiveLogonRight (+ Deny)
   - Flags non-local/domain principals in local groups (SID-based, machine SID baseline)
   - Findings + deterministic dedup
-  - Output (main): currentrights_<HOSTNAME>_<TIMESTAMP>.csv
-  - Output (main): CSV to console (stdout)
+  - Output: CSV to console (stdout) only
 
 .NOTES
   Read-only. Run as Administrator for best results (secedit export can be blocked otherwise).
@@ -17,9 +16,11 @@
 [CmdletBinding()]
 param(
     [ValidateNotNullOrEmpty()]
-    [string]$Delimiter = ',',     # set to ';' if you prefer Excel in DK environments
-    [switch]$IncludeAllLocalGroups = $true,
-    [switch]$IncludeWellKnownGroups = $true
+    [string]$Delimiter = ',',     # set to ';' for Excel DK environments
+
+    # Use [bool] instead of [switch] so defaults can be $true reliably
+    [bool]$IncludeAllLocalGroups = $true,
+    [bool]$IncludeWellKnownGroups = $true
 )
 
 Set-StrictMode -Version Latest
@@ -29,11 +30,6 @@ $ErrorActionPreference = 'Stop'
 # Host info
 # ---------------------------
 $hostname  = $env:COMPUTERNAME
-$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-
-if (-not (Test-Path $OutDir)) { New-Item -Path $OutDir -ItemType Directory -Force | Out-Null }
-
-$outPathMain = Join-Path $OutDir ("currentrights_{0}_{1}.csv" -f $hostname, $timestamp)
 
 # ---------------------------
 # Helpers
@@ -47,9 +43,7 @@ function New-NormSet {
     param([string[]]$Values)
     $set = New-Object 'System.Collections.Generic.HashSet[string]'
     if ($Values) {
-        foreach ($val in $Values) {
-            $null = $set.Add((Norm $val))
-        }
+        foreach ($val in $Values) { $null = $set.Add((Norm $val)) }
     }
     return $set
 }
@@ -128,6 +122,7 @@ function Classify-Principal {
             else { $isDomainSid = $true }
         }
         else {
+            # If we can't compute machine base, treat S-1-5-21 as "not builtin/local"
             $isDomainSid = $true
         }
     }
@@ -403,16 +398,6 @@ try {
     }
     else {
         $lines = Get-Content -LiteralPath $infPath -Encoding Unicode -ErrorAction Stop
-        $rightsAssignments = @{}
-
-        foreach ($line in $lines) {
-            if ($line -notmatch '^\s*([^=]+?)\s*=\s*(.*)$') { continue }
-            $key = $Matches[1].Trim()
-            $value = $Matches[2].Trim()
-            if (-not $rightsMap.ContainsKey($key)) { continue }
-            $rightsAssignments[$key] = $value
-        }
-
         $assignments = Get-UserRightsAssignments -Lines $lines
 
         foreach ($rightId in $rightsMap.Keys) {
@@ -459,10 +444,14 @@ foreach ($sid in $highRiskGroupsSid) {
     $gName = Get-LocalizedLocalGroupNameFromSid $sid
     if (-not $gName) { continue }
 
-    $members = $rows | Where-Object { $_.Category -eq 'LocalGroupMember' -and (Norm $_.LocalGroup) -eq (Norm $gName) -and $_.PrincipalResolved }
+    $members = $rows | Where-Object {
+        $_.Category -eq 'LocalGroupMember' -and (Norm $_.LocalGroup) -eq (Norm $gName) -and $_.PrincipalResolved
+    }
+
     foreach ($m in $members) {
         if ($m.IsNonLocalPrincipal -eq $true) {
-            Add-Finding -Severity 'High' -FindingId 'NonLocalPrincipalInHighRiskLocalGroup' -Evidence ("Group={0}; Principal={1}; SID={2}" -f $gName, $m.PrincipalResolved, $m.PrincipalSid)
+            Add-Finding -Severity 'High' -FindingId 'NonLocalPrincipalInHighRiskLocalGroup' `
+                -Evidence ("Group={0}; Principal={1}; SID={2}" -f $gName, $m.PrincipalResolved, $m.PrincipalSid)
         }
     }
 }
@@ -477,7 +466,7 @@ try {
     $rduGroupResolvedNorm = Norm $rduNt
 
     $rduMembers = $rows |
-        Where-Object { $_.Category -eq 'LocalGroupMember' -and (Norm($_.LocalGroup) -eq (Norm($rduLocalName))) -and $_.PrincipalResolved } |
+        Where-Object { $_.Category -eq 'LocalGroupMember' -and (Norm $_.LocalGroup) -eq (Norm $rduLocalName) -and $_.PrincipalResolved } |
         Select-Object -ExpandProperty PrincipalResolved -Unique
 
     $allowRdp = $rows |
@@ -499,7 +488,8 @@ try {
         -Evidence ("AllowGroupCovered={0}; DenyGroupCovered={1}; Members={2}" -f $allowGroupCovered, $denyGroupCovered, ($rduMembers.Count))
 
     if ($denyGroupCovered) {
-        Add-Finding -Severity 'High' -FindingId 'RDPDenyAppliedToRemoteDesktopUsersGroup' -Evidence ("Group={0} has SeDenyRemoteInteractiveLogonRight" -f $rduNt)
+        Add-Finding -Severity 'High' -FindingId 'RDPDenyAppliedToRemoteDesktopUsersGroup' `
+            -Evidence ("Group={0} has SeDenyRemoteInteractiveLogonRight" -f $rduNt)
     }
 
     foreach ($m in $rduMembers) {
@@ -514,7 +504,8 @@ try {
             -Evidence ("AllowGroupCovered={0}; ExplicitAllow={1}; DenyGroupCovered={2}; ExplicitDeny={3}; EffectiveAllowed={4}" -f $allowGroupCovered, $isExplicitlyAllowed, $denyGroupCovered, $isExplicitlyDenied, $effectiveAllowed)
 
         if (-not $effectiveAllowed) {
-            Add-Finding -Severity 'Medium' -FindingId 'RDU_Member_NotEffectivelyAllowedForRDP' -Evidence ("Member={0}; AllowGroupCovered={1}; ExplicitAllow={2}; DenyGroupCovered={3}; ExplicitDeny={4}" -f $m, $allowGroupCovered, $isExplicitlyAllowed, $denyGroupCovered, $isExplicitlyDenied)
+            Add-Finding -Severity 'Medium' -FindingId 'RDU_Member_NotEffectivelyAllowedForRDP' `
+                -Evidence ("Member={0}; AllowGroupCovered={1}; ExplicitAllow={2}; DenyGroupCovered={3}; ExplicitDeny={4}" -f $m, $allowGroupCovered, $isExplicitlyAllowed, $denyGroupCovered, $isExplicitlyDenied)
         }
     }
 
@@ -547,23 +538,15 @@ foreach ($rid in $highRiskRights) {
     $entries = $rows | Where-Object { $_.Category -eq 'UserRightAssignment' -and $_.RightId -eq $rid -and $_.PrincipalResolved }
     foreach ($e in $entries) {
         if ($e.IsNonLocalPrincipal -eq $true -or $e.IsDomainSid -eq $true -or $e.IsDomainLikeName -eq $true) {
-            Add-Finding -Severity 'Medium' -FindingId 'NonLocalPrincipalAssignedToUserRight' -Evidence ("Right={0}; Principal={1}; SID={2}" -f $rid, $e.PrincipalResolved, $e.PrincipalSid)
+            Add-Finding -Severity 'Medium' -FindingId 'NonLocalPrincipalAssignedToUserRight' `
+                -Evidence ("Right={0}; Principal={1}; SID={2}" -f $rid, $e.PrincipalResolved, $e.PrincipalSid)
         }
     }
 }
 
 # ---------------------------
-# Export main CSV
-# Export main CSV to console (NO OS/GPO categories exist anymore in rows)
+# Output CSV to console ONLY
 # ---------------------------
-$rows |
-    Select-Object Hostname, Category, LocalGroup, RightName, RightId,
-        PrincipalRaw, PrincipalResolved, PrincipalSid, PrincipalType,
-        IsNonLocalPrincipal, IsDomainSid, IsDomainLikeName, IsGroupHint,
-        Severity, FindingId, Evidence, Source |
-    Export-Csv -LiteralPath $outPathMain -NoTypeInformation -Encoding UTF8 -Delimiter $Delimiter
-
-Write-Host "Saved main CSV:     $outPathMain"
 $rows |
     Select-Object Hostname, Category, LocalGroup, RightName, RightId,
         PrincipalRaw, PrincipalResolved, PrincipalSid, PrincipalType,
