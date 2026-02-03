@@ -8,7 +8,6 @@
   - Flags non-local/domain principals in local groups (SID-based, machine SID baseline)
   - Findings + deterministic dedup
   - Output (main): currentrights_<HOSTNAME>_<TIMESTAMP>.csv
-  - Output (context/test file): context_<HOSTNAME>_<TIMESTAMP>.txt   (OS + gpresult)
 
 .NOTES
   Read-only. Run as Administrator for best results (secedit export can be blocked otherwise).
@@ -20,8 +19,7 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$Delimiter = ',',     # set to ';' if you prefer Excel in DK environments
     [switch]$IncludeAllLocalGroups = $true,
-    [switch]$IncludeWellKnownGroups = $true,
-    [switch]$IncludeGpResultEvidence = $true
+    [switch]$IncludeWellKnownGroups = $true
 )
 
 Set-StrictMode -Version Latest
@@ -35,22 +33,7 @@ $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 
 if (-not (Test-Path $OutDir)) { New-Item -Path $OutDir -ItemType Directory -Force | Out-Null }
 
-$outPathMain    = Join-Path $OutDir ("currentrights_{0}_{1}.csv" -f $hostname, $timestamp)
-$outPathContext = Join-Path $OutDir ("context_{0}_{1}.txt" -f $hostname, $timestamp)
-
-# Collect context in-memory; write at end
-$contextLines = New-Object System.Collections.Generic.List[string]
-
-function Add-ContextLine([string]$Line) {
-    if ($null -ne $Line) { $contextLines.Add($Line) }
-}
-
-Add-ContextLine ("# Context file")
-Add-ContextLine ("Hostname: {0}" -f $hostname)
-Add-ContextLine ("Timestamp: {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
-Add-ContextLine ("OutDir: {0}" -f $OutDir)
-Add-ContextLine ("MainCSV: {0}" -f $outPathMain)
-Add-ContextLine ("---")
+$outPathMain = Join-Path $OutDir ("currentrights_{0}_{1}.csv" -f $hostname, $timestamp)
 
 # ---------------------------
 # Helpers
@@ -226,50 +209,6 @@ function Add-Finding {
 }
 
 # ---------------------------
-# Context: OS info -> context file only (NOT CSV)
-# ---------------------------
-try {
-    $os = Get-CimInstance Win32_OperatingSystem
-    $cs = Get-CimInstance Win32_ComputerSystem
-
-    Add-ContextLine "## OS / System"
-    Add-ContextLine ("OS: {0}" -f $os.Caption)
-    Add-ContextLine ("Version: {0}" -f $os.Version)
-    Add-ContextLine ("Build: {0}" -f $os.BuildNumber)
-    Add-ContextLine ("PartOfDomain: {0}" -f $cs.PartOfDomain)
-    Add-ContextLine ("DomainOrWorkgroup: {0}" -f $cs.Domain)
-    if ($MachineSidBase) { Add-ContextLine ("MachineSidBase: {0}" -f $MachineSidBase) }
-    Add-ContextLine ("---")
-}
-catch {
-    Add-ContextLine ("OS/System context failed: {0}" -f $_.Exception.Message)
-    Add-ContextLine ("---")
-}
-
-# ---------------------------
-# Context: gpresult -> context file only (NOT CSV)
-# ---------------------------
-if ($IncludeGpResultEvidence) {
-    try {
-        Add-ContextLine "## GPResult (Computer scope)"
-        $gp = & gpresult.exe /R /SCOPE COMPUTER 2>$null
-        $exit = $LASTEXITCODE
-
-        if ($exit -eq 0 -and $gp) {
-            Add-ContextLine ("gpresult ExitCode: {0}" -f $exit)
-            Add-ContextLine (($gp -join "`n"))
-        }
-        else {
-            Add-ContextLine ("gpresult failed or blocked. ExitCode={0}" -f $exit)
-        }
-        Add-ContextLine ("---")
-    } catch {
-        Add-ContextLine ("gpresult exception: {0}" -f $_.Exception.Message)
-        Add-ContextLine ("---")
-    }
-}
-
-# ---------------------------
 # Well-known high-risk groups (language independent via SID)
 # ---------------------------
 $WellKnownLocalGroups = @{
@@ -429,18 +368,22 @@ try {
     }
     else {
         $lines = Get-Content -LiteralPath $infPath -Encoding Unicode -ErrorAction Stop
+        $rightsAssignments = @{}
+
+        foreach ($line in $lines) {
+            if ($line -notmatch '^\s*([^=]+?)\s*=\s*(.*)$') { continue }
+            $key = $Matches[1].Trim()
+            $value = $Matches[2].Trim()
+            if (-not $rightsMap.ContainsKey($key)) { continue }
+            $rightsAssignments[$key] = $value
+        }
 
         foreach ($rightId in $rightsMap.Keys) {
-            $rightName = $rightsMap[$rightId]
-            $match = $lines | Where-Object { $_ -match ("^\s*{0}\s*=" -f [regex]::Escape($rightId)) } | Select-Object -First 1
-            if (-not $match) { continue }
-
-            $parts = $match.Split('=',2)
-            if ($parts.Count -ne 2) { continue }
-
-            $rawList = $parts[1].Trim()
+            if (-not $rightsAssignments.ContainsKey($rightId)) { continue }
+            $rawList = $rightsAssignments[$rightId]
             if ([string]::IsNullOrWhiteSpace($rawList)) { continue }
 
+            $rightName = $rightsMap[$rightId]
             $principals = $rawList.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
             foreach ($p in $principals) {
                 $resolved = Try-TranslateToName -SidOrName $p
@@ -572,7 +515,7 @@ foreach ($rid in $highRiskRights) {
 }
 
 # ---------------------------
-# Export main CSV (NO OS/GPO categories exist anymore in rows)
+# Export main CSV
 # ---------------------------
 $rows |
     Select-Object Hostname, Category, LocalGroup, RightName, RightId,
@@ -581,10 +524,4 @@ $rows |
         Severity, FindingId, Evidence, Source |
     Export-Csv -LiteralPath $outPathMain -NoTypeInformation -Encoding UTF8 -Delimiter $Delimiter
 
-# ---------------------------
-# Write context file (OS + gpresult)
-# ---------------------------
-$contextLines | Set-Content -LiteralPath $outPathContext -Encoding UTF8
-
 Write-Host "Saved main CSV:     $outPathMain"
-Write-Host "Saved context file: $outPathContext"
