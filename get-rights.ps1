@@ -225,6 +225,30 @@ function Add-Finding {
         -Source 'FindingEngine' -Severity $Severity -FindingId $FindingId -Evidence $Evidence
 }
 
+function Get-UserRightsAssignments {
+    param(
+        [Parameter(Mandatory)][string[]]$Lines
+    )
+
+    $assignments = @{}
+    foreach ($line in $Lines) {
+        if ($line -match '^\s*;' -or [string]::IsNullOrWhiteSpace($line)) { continue }
+        $parts = $line.Split('=', 2)
+        if ($parts.Count -ne 2) { continue }
+
+        $rightId = $parts[0].Trim()
+        $rawList = $parts[1].Trim()
+        if ([string]::IsNullOrWhiteSpace($rightId) -or [string]::IsNullOrWhiteSpace($rawList)) { continue }
+
+        $principals = $rawList.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+        if ($principals.Count -gt 0) {
+            $assignments[$rightId] = $principals
+        }
+    }
+
+    return $assignments
+}
+
 # ---------------------------
 # Context: OS info -> context file only (NOT CSV)
 # ---------------------------
@@ -429,19 +453,13 @@ try {
     }
     else {
         $lines = Get-Content -LiteralPath $infPath -Encoding Unicode -ErrorAction Stop
+        $assignments = Get-UserRightsAssignments -Lines $lines
 
         foreach ($rightId in $rightsMap.Keys) {
             $rightName = $rightsMap[$rightId]
-            $match = $lines | Where-Object { $_ -match ("^\s*{0}\s*=" -f [regex]::Escape($rightId)) } | Select-Object -First 1
-            if (-not $match) { continue }
+            $principals = $assignments[$rightId]
+            if (-not $principals) { continue }
 
-            $parts = $match.Split('=',2)
-            if ($parts.Count -ne 2) { continue }
-
-            $rawList = $parts[1].Trim()
-            if ([string]::IsNullOrWhiteSpace($rawList)) { continue }
-
-            $principals = $rawList.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
             foreach ($p in $principals) {
                 $resolved = Try-TranslateToName -SidOrName $p
                 Add-Row -Category 'UserRightAssignment' -LocalGroup '' -RightName $rightName -RightId $rightId -PrincipalRaw $resolved -PrincipalType '' `
