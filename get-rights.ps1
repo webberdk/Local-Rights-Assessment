@@ -8,6 +8,7 @@
   - Flags non-local/domain principals in local groups (SID-based, machine SID baseline)
   - Findings + deterministic dedup
   - Output (main): currentrights_<HOSTNAME>_<TIMESTAMP>.csv
+  - Output (main): CSV to console (stdout)
 
 .NOTES
   Read-only. Run as Administrator for best results (secedit export can be blocked otherwise).
@@ -15,7 +16,6 @@
 
 [CmdletBinding()]
 param(
-    [string]$OutDir = 'C:\temp',
     [ValidateNotNullOrEmpty()]
     [string]$Delimiter = ',',     # set to ';' if you prefer Excel in DK environments
     [switch]$IncludeAllLocalGroups = $true,
@@ -26,7 +26,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # ---------------------------
-# Output paths
+# Host info
 # ---------------------------
 $hostname  = $env:COMPUTERNAME
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -41,6 +41,17 @@ $outPathMain = Join-Path $OutDir ("currentrights_{0}_{1}.csv" -f $hostname, $tim
 function Norm([string]$s) {
     if ([string]::IsNullOrWhiteSpace($s)) { return '' }
     return $s.Trim().ToLowerInvariant()
+}
+
+function New-NormSet {
+    param([string[]]$Values)
+    $set = New-Object 'System.Collections.Generic.HashSet[string]'
+    if ($Values) {
+        foreach ($val in $Values) {
+            $null = $set.Add((Norm $val))
+        }
+    }
+    return $set
 }
 
 function Try-TranslateToSid {
@@ -206,6 +217,30 @@ function Add-Finding {
     )
     Add-Row -Category 'Finding' -LocalGroup '' -RightName '' -RightId '' -PrincipalRaw '' -PrincipalType '' `
         -Source 'FindingEngine' -Severity $Severity -FindingId $FindingId -Evidence $Evidence
+}
+
+function Get-UserRightsAssignments {
+    param(
+        [Parameter(Mandatory)][string[]]$Lines
+    )
+
+    $assignments = @{}
+    foreach ($line in $Lines) {
+        if ($line -match '^\s*;' -or [string]::IsNullOrWhiteSpace($line)) { continue }
+        $parts = $line.Split('=', 2)
+        if ($parts.Count -ne 2) { continue }
+
+        $rightId = $parts[0].Trim()
+        $rawList = $parts[1].Trim()
+        if ([string]::IsNullOrWhiteSpace($rightId) -or [string]::IsNullOrWhiteSpace($rawList)) { continue }
+
+        $principals = $rawList.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+        if ($principals.Count -gt 0) {
+            $assignments[$rightId] = $principals
+        }
+    }
+
+    return $assignments
 }
 
 # ---------------------------
@@ -385,6 +420,13 @@ try {
 
             $rightName = $rightsMap[$rightId]
             $principals = $rawList.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+        $assignments = Get-UserRightsAssignments -Lines $lines
+
+        foreach ($rightId in $rightsMap.Keys) {
+            $rightName = $rightsMap[$rightId]
+            $principals = $assignments[$rightId]
+            if (-not $principals) { continue }
+
             foreach ($p in $principals) {
                 $resolved = Try-TranslateToName -SidOrName $p
                 Add-Row -Category 'UserRightAssignment' -LocalGroup '' -RightName $rightName -RightId $rightId -PrincipalRaw $resolved -PrincipalType '' `
@@ -453,8 +495,11 @@ try {
         Where-Object { $_.Category -eq 'UserRightAssignment' -and $_.RightId -eq 'SeDenyRemoteInteractiveLogonRight' -and $_.PrincipalResolved } |
         Select-Object -ExpandProperty PrincipalResolved -Unique
 
-    $allowGroupCovered = ($allowRdp | ForEach-Object { Norm $_ }) -contains $rduGroupResolvedNorm
-    $denyGroupCovered  = ($denyRdp  | ForEach-Object { Norm $_ }) -contains $rduGroupResolvedNorm
+    $allowSet = New-NormSet -Values $allowRdp
+    $denySet  = New-NormSet -Values $denyRdp
+
+    $allowGroupCovered = $allowSet.Contains($rduGroupResolvedNorm)
+    $denyGroupCovered  = $denySet.Contains($rduGroupResolvedNorm)
 
     Add-Row -Category 'CrossReference' -LocalGroup $rduLocalName -RightName $rightsMap['SeRemoteInteractiveLogonRight'] -RightId 'SeRemoteInteractiveLogonRight' `
         -PrincipalRaw $rduNt -PrincipalType 'Group' -Source 'CrossRefSummary' -Severity '' -FindingId '' `
@@ -466,8 +511,8 @@ try {
 
     foreach ($m in $rduMembers) {
         $mNorm = Norm $m
-        $isExplicitlyAllowed = (($allowRdp | ForEach-Object { Norm $_ }) -contains $mNorm)
-        $isExplicitlyDenied  = (($denyRdp  | ForEach-Object { Norm $_ }) -contains $mNorm)
+        $isExplicitlyAllowed = $allowSet.Contains($mNorm)
+        $isExplicitlyDenied  = $denySet.Contains($mNorm)
 
         $effectiveAllowed = ($allowGroupCovered -or $isExplicitlyAllowed) -and (-not ($denyGroupCovered -or $isExplicitlyDenied))
 
@@ -516,6 +561,7 @@ foreach ($rid in $highRiskRights) {
 
 # ---------------------------
 # Export main CSV
+# Export main CSV to console (NO OS/GPO categories exist anymore in rows)
 # ---------------------------
 $rows |
     Select-Object Hostname, Category, LocalGroup, RightName, RightId,
@@ -525,3 +571,7 @@ $rows |
     Export-Csv -LiteralPath $outPathMain -NoTypeInformation -Encoding UTF8 -Delimiter $Delimiter
 
 Write-Host "Saved main CSV:     $outPathMain"
+    ConvertTo-Csv -NoTypeInformation -Delimiter $Delimiter |
+    ForEach-Object { Write-Output $_ }
+
+Write-Host "Wrote main CSV to console."
