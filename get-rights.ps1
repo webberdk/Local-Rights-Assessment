@@ -7,8 +7,7 @@
   - Cross-reference: Remote Desktop Users vs SeRemoteInteractiveLogonRight (+ Deny)
   - Flags non-local/domain principals in local groups (SID-based, machine SID baseline)
   - Findings + deterministic dedup
-  - Output (main): currentrights_<HOSTNAME>_<TIMESTAMP>.csv
-  - Output (context/test file): context_<HOSTNAME>_<TIMESTAMP>.txt   (OS context)
+  - Output (main): CSV to console (stdout)
 
 .NOTES
   Read-only. Run as Administrator for best results (secedit export can be blocked otherwise).
@@ -16,7 +15,6 @@
 
 [CmdletBinding()]
 param(
-    [string]$OutDir = 'C:\temp',
     [ValidateNotNullOrEmpty()]
     [string]$Delimiter = ',',     # set to ';' if you prefer Excel in DK environments
     [switch]$IncludeAllLocalGroups = $true,
@@ -27,29 +25,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # ---------------------------
-# Output paths
+# Host info
 # ---------------------------
 $hostname  = $env:COMPUTERNAME
-$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-
-if (-not (Test-Path $OutDir)) { New-Item -Path $OutDir -ItemType Directory -Force | Out-Null }
-
-$outPathMain    = Join-Path $OutDir ("currentrights_{0}_{1}.csv" -f $hostname, $timestamp)
-$outPathContext = Join-Path $OutDir ("context_{0}_{1}.txt" -f $hostname, $timestamp)
-
-# Collect context in-memory; write at end
-$contextLines = New-Object System.Collections.Generic.List[string]
-
-function Add-ContextLine([string]$Line) {
-    if ($null -ne $Line) { $contextLines.Add($Line) }
-}
-
-Add-ContextLine ("# Context file")
-Add-ContextLine ("Hostname: {0}" -f $hostname)
-Add-ContextLine ("Timestamp: {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
-Add-ContextLine ("OutDir: {0}" -f $OutDir)
-Add-ContextLine ("MainCSV: {0}" -f $outPathMain)
-Add-ContextLine ("---")
 
 # ---------------------------
 # Helpers
@@ -257,27 +235,6 @@ function Get-UserRightsAssignments {
     }
 
     return $assignments
-}
-
-# ---------------------------
-# Context: OS info -> context file only (NOT CSV)
-# ---------------------------
-try {
-    $os = Get-CimInstance Win32_OperatingSystem
-    $cs = Get-CimInstance Win32_ComputerSystem
-
-    Add-ContextLine "## OS / System"
-    Add-ContextLine ("OS: {0}" -f $os.Caption)
-    Add-ContextLine ("Version: {0}" -f $os.Version)
-    Add-ContextLine ("Build: {0}" -f $os.BuildNumber)
-    Add-ContextLine ("PartOfDomain: {0}" -f $cs.PartOfDomain)
-    Add-ContextLine ("DomainOrWorkgroup: {0}" -f $cs.Domain)
-    if ($MachineSidBase) { Add-ContextLine ("MachineSidBase: {0}" -f $MachineSidBase) }
-    Add-ContextLine ("---")
-}
-catch {
-    Add-ContextLine ("OS/System context failed: {0}" -f $_.Exception.Message)
-    Add-ContextLine ("---")
 }
 
 # ---------------------------
@@ -580,19 +537,14 @@ foreach ($rid in $highRiskRights) {
 }
 
 # ---------------------------
-# Export main CSV (NO OS/GPO categories exist anymore in rows)
+# Export main CSV to console (NO OS/GPO categories exist anymore in rows)
 # ---------------------------
 $rows |
     Select-Object Hostname, Category, LocalGroup, RightName, RightId,
         PrincipalRaw, PrincipalResolved, PrincipalSid, PrincipalType,
         IsNonLocalPrincipal, IsDomainSid, IsDomainLikeName, IsGroupHint,
         Severity, FindingId, Evidence, Source |
-    Export-Csv -LiteralPath $outPathMain -NoTypeInformation -Encoding UTF8 -Delimiter $Delimiter
+    ConvertTo-Csv -NoTypeInformation -Delimiter $Delimiter |
+    ForEach-Object { Write-Output $_ }
 
-# ---------------------------
-# Write context file (OS context)
-# ---------------------------
-$contextLines | Set-Content -LiteralPath $outPathContext -Encoding UTF8
-
-Write-Host "Saved main CSV:     $outPathMain"
-Write-Host "Saved context file: $outPathContext"
+Write-Host "Wrote main CSV to console."
