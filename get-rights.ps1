@@ -7,6 +7,7 @@
   - Cross-reference: Remote Desktop Users vs SeRemoteInteractiveLogonRight (+ Deny)
   - Flags non-local/domain principals in local groups (SID-based, machine SID baseline)
   - Findings + deterministic dedup
+  - Output (main): currentrights_<HOSTNAME>_<TIMESTAMP>.csv
   - Output (main): CSV to console (stdout)
 
 .NOTES
@@ -28,6 +29,11 @@ $ErrorActionPreference = 'Stop'
 # Host info
 # ---------------------------
 $hostname  = $env:COMPUTERNAME
+$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+
+if (-not (Test-Path $OutDir)) { New-Item -Path $OutDir -ItemType Directory -Force | Out-Null }
+
+$outPathMain = Join-Path $OutDir ("currentrights_{0}_{1}.csv" -f $hostname, $timestamp)
 
 # ---------------------------
 # Helpers
@@ -397,6 +403,23 @@ try {
     }
     else {
         $lines = Get-Content -LiteralPath $infPath -Encoding Unicode -ErrorAction Stop
+        $rightsAssignments = @{}
+
+        foreach ($line in $lines) {
+            if ($line -notmatch '^\s*([^=]+?)\s*=\s*(.*)$') { continue }
+            $key = $Matches[1].Trim()
+            $value = $Matches[2].Trim()
+            if (-not $rightsMap.ContainsKey($key)) { continue }
+            $rightsAssignments[$key] = $value
+        }
+
+        foreach ($rightId in $rightsMap.Keys) {
+            if (-not $rightsAssignments.ContainsKey($rightId)) { continue }
+            $rawList = $rightsAssignments[$rightId]
+            if ([string]::IsNullOrWhiteSpace($rawList)) { continue }
+
+            $rightName = $rightsMap[$rightId]
+            $principals = $rawList.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
         $assignments = Get-UserRightsAssignments -Lines $lines
 
         foreach ($rightId in $rightsMap.Keys) {
@@ -537,6 +560,7 @@ foreach ($rid in $highRiskRights) {
 }
 
 # ---------------------------
+# Export main CSV
 # Export main CSV to console (NO OS/GPO categories exist anymore in rows)
 # ---------------------------
 $rows |
@@ -544,6 +568,9 @@ $rows |
         PrincipalRaw, PrincipalResolved, PrincipalSid, PrincipalType,
         IsNonLocalPrincipal, IsDomainSid, IsDomainLikeName, IsGroupHint,
         Severity, FindingId, Evidence, Source |
+    Export-Csv -LiteralPath $outPathMain -NoTypeInformation -Encoding UTF8 -Delimiter $Delimiter
+
+Write-Host "Saved main CSV:     $outPathMain"
     ConvertTo-Csv -NoTypeInformation -Delimiter $Delimiter |
     ForEach-Object { Write-Output $_ }
 
