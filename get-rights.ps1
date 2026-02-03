@@ -413,13 +413,6 @@ try {
             $rightsAssignments[$key] = $value
         }
 
-        foreach ($rightId in $rightsMap.Keys) {
-            if (-not $rightsAssignments.ContainsKey($rightId)) { continue }
-            $rawList = $rightsAssignments[$rightId]
-            if ([string]::IsNullOrWhiteSpace($rawList)) { continue }
-
-            $rightName = $rightsMap[$rightId]
-            $principals = $rawList.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
         $assignments = Get-UserRightsAssignments -Lines $lines
 
         foreach ($rightId in $rightsMap.Keys) {
@@ -571,7 +564,10 @@ $rows |
     Export-Csv -LiteralPath $outPathMain -NoTypeInformation -Encoding UTF8 -Delimiter $Delimiter
 
 Write-Host "Saved main CSV:     $outPathMain"
+$rows |
+    Select-Object Hostname, Category, LocalGroup, RightName, RightId,
+        PrincipalRaw, PrincipalResolved, PrincipalSid, PrincipalType,
+        IsNonLocalPrincipal, IsDomainSid, IsDomainLikeName, IsGroupHint,
+        Severity, FindingId, Evidence, Source |
     ConvertTo-Csv -NoTypeInformation -Delimiter $Delimiter |
     ForEach-Object { Write-Output $_ }
-
-Write-Host "Wrote main CSV to console."
