@@ -1,24 +1,43 @@
 #requires -version 5.1
 <#
 .SYNOPSIS
-  Local rights audit for hardening / GPO replacement:
-  - Local group memberships (all groups) + explicit well-known high-risk groups (language independent)
-  - User Rights Assignments (Allow + Deny) via secedit USER_RIGHTS (uses TEMP file, deleted afterwards)
-  - Cross-reference: Remote Desktop Users vs SeRemoteInteractiveLogonRight (+ Deny)
-  - Flags non-local/domain principals in local groups (SID-based, machine SID baseline)
-  - Findings + deterministic dedup
-  - Output: CSV to console (stdout) only
+  Tanium Sensor-ready Local Rights Audit (STDOUT JSON, bulk-download friendly)
+
+  Collects (READ-ONLY):
+    - Local group memberships (all groups) + explicit well-known high-risk groups (SID-based, locale independent)
+    - User Rights Assignments via secedit USER_RIGHTS
+    - Cross-reference: Remote Desktop Users vs SeRemoteInteractiveLogonRight (+ Deny)
+    - Findings:
+        * NonLocalPrincipalInHighRiskLocalGroup
+        * NonLocalPrincipalAssignedToUserRight
+        * RDPDenyAppliedToRemoteDesktopUsersGroup
+        * RDU_Member_NotEffectivelyAllowedForRDP
+        * RemoteDesktopUsersGroupEmpty
+
+  Output:
+    - JSON to STDOUT (pretty / multiline) with chunking for long strings to avoid mid-token breaks in Tanium UI/export.
+    - Structure:
+        {
+          "schema":"LocalRightsAuditChunkedJsonV1",
+          "generatedUtc":"...",
+          "hostname":"...",
+          "domainOrWorkgroup":"...",
+          "summary":{...},
+          "rows":[ ... ]
+        }
 
 .NOTES
-  Read-only. Run as Administrator for best results (secedit export can be blocked otherwise).
+  - Designed for Tanium Sensor running across many endpoints and bulk downloading results.
+  - Chunking: long strings are emitted as arrays of short strings. Parser can join arrays back to strings.
+  - No file writes; all output to STDOUT.
 #>
 
 [CmdletBinding()]
 param(
-    [ValidateNotNullOrEmpty()]
-    [string]$Delimiter = ',',     # set to ';' for Excel DK environments
+    # Chunk long strings to avoid mid-token breaks when Tanium wraps/exports.
+    [int]$ChunkSize = 48,
+    [int]$ChunkThreshold = 60,
 
-    # Use [bool] instead of [switch] so defaults can be $true reliably
     [bool]$IncludeAllLocalGroups = $true,
     [bool]$IncludeWellKnownGroups = $true
 )
@@ -29,7 +48,13 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------
 # Host info
 # ---------------------------
-$hostname  = $env:COMPUTERNAME
+$hostname = $env:COMPUTERNAME
+
+$machineDomain = ''
+try {
+    $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+    if ($cs.PartOfDomain) { $machineDomain = [string]$cs.Domain } else { $machineDomain = [string]$cs.Workgroup }
+} catch { $machineDomain = '' }
 
 # ---------------------------
 # Helpers
@@ -48,20 +73,42 @@ function New-NormSet {
     return $set
 }
 
+function Split-Chunk {
+    param(
+        [AllowNull()][string]$Value,
+        [int]$ChunkSizeLocal
+    )
+    if ([string]::IsNullOrEmpty($Value)) { return @() }
+    $chunks = New-Object 'System.Collections.Generic.List[string]'
+    for ($i = 0; $i -lt $Value.Length; $i += $ChunkSizeLocal) {
+        $len = [Math]::Min($ChunkSizeLocal, $Value.Length - $i)
+        $chunks.Add($Value.Substring($i, $len))
+    }
+    return ,$chunks.ToArray()
+}
+
+function To-ChunkOrScalar {
+    param(
+        [AllowNull()][string]$Value,
+        [int]$Threshold,
+        [int]$ChunkSizeLocal
+    )
+    if ([string]::IsNullOrEmpty($Value)) { return '' }
+    if ($Value.Length -ge $Threshold) { return (Split-Chunk -Value $Value -ChunkSizeLocal $ChunkSizeLocal) }
+    return $Value
+}
+
 function Try-TranslateToSid {
     param([string]$NameOrSid)
     if ([string]::IsNullOrWhiteSpace($NameOrSid)) { return $null }
 
     $v = $NameOrSid.Trim()
     if ($v.StartsWith('*')) { $v = $v.Substring(1) }
-
     if ($v -match '^S-\d-\d+-.+') { return $v }
 
     try {
         return ([System.Security.Principal.NTAccount]$v).Translate([System.Security.Principal.SecurityIdentifier]).Value
-    } catch {
-        return $null
-    }
+    } catch { return $null }
 }
 
 function Try-TranslateToName {
@@ -74,22 +121,16 @@ function Try-TranslateToName {
     if ($v -match '^S-\d-\d+-.+') {
         try {
             return ([System.Security.Principal.SecurityIdentifier]$v).Translate([System.Security.Principal.NTAccount]).Value
-        } catch {
-            return $null
-        }
+        } catch { return $null }
     }
     return $v
 }
 
 function Get-MachineSidBase {
-    # Derive machine SID base from local Administrator account SID (RID 500),
-    # without relying on localized "Administrator" name.
     try {
         $admin = Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True AND SID LIKE 'S-1-5-21-%-500'" -ErrorAction Stop |
                  Select-Object -First 1
-        if ($admin -and $admin.SID) {
-            return ($admin.SID -replace '-500$','')
-        }
+        if ($admin -and $admin.SID) { return ($admin.SID -replace '-500$','') }
     } catch {}
     return $null
 }
@@ -118,11 +159,8 @@ function Classify-Principal {
     if ($sid -and $sid -match '^S-1-5-21-') {
         if ($MachineSidBase) {
             $sidBase = ($sid -replace '-\d+$','') # remove RID
-            if ($sidBase -eq $MachineSidBase) { $isLocalSid = $true }
-            else { $isDomainSid = $true }
-        }
-        else {
-            # If we can't compute machine base, treat S-1-5-21 as "not builtin/local"
+            if ($sidBase -eq $MachineSidBase) { $isLocalSid = $true } else { $isDomainSid = $true }
+        } else {
             $isDomainSid = $true
         }
     }
@@ -130,9 +168,7 @@ function Classify-Principal {
     $isGroup = $false
     if ($PrincipalType) { $isGroup = ($PrincipalType -match 'Group') }
 
-    $isDomainLikeName =
-        ($raw -match '^[^\\]+\\.+') -and (-not $isBuiltin)
-
+    $isDomainLikeName = ($raw -match '^[^\\]+\\.+') -and (-not $isBuiltin)
     $isNonLocalPrincipal = (-not $isBuiltin) -and ($isDomainLikeName -or $isDomainSid)
 
     return @{
@@ -164,22 +200,16 @@ function Add-Row {
 
     $sid = Try-TranslateToSid -NameOrSid $PrincipalRaw
     $resolved = if ($sid) { (Try-TranslateToName -SidOrName $sid) } else { $PrincipalRaw }
-
     $cls = Classify-Principal -PrincipalRaw $resolved -PrincipalSid $sid -PrincipalType $PrincipalType
 
     $key = ('{0}|{1}|{2}|{3}|{4}|{5}|{6}' -f
-        $hostname,
-        (Norm $Category),
-        (Norm $LocalGroup),
-        (Norm $RightId),
-        (Norm $resolved),
-        (Norm $sid),
-        (Norm $FindingId)
+        $hostname,(Norm $Category),(Norm $LocalGroup),(Norm $RightId),(Norm $resolved),(Norm $sid),(Norm $FindingId)
     )
 
     if ($dedup.Add($key)) {
         $rows.Add([pscustomobject]@{
             Hostname            = $hostname
+            Domain              = $machineDomain
             Category            = $Category
             LocalGroup          = $LocalGroup
             RightName           = $RightName
@@ -215,9 +245,7 @@ function Add-Finding {
 }
 
 function Get-UserRightsAssignments {
-    param(
-        [Parameter(Mandatory)][string[]]$Lines
-    )
+    param([Parameter(Mandatory)][string[]]$Lines)
 
     $assignments = @{}
     foreach ($line in $Lines) {
@@ -229,17 +257,14 @@ function Get-UserRightsAssignments {
         $rawList = $parts[1].Trim()
         if ([string]::IsNullOrWhiteSpace($rightId) -or [string]::IsNullOrWhiteSpace($rawList)) { continue }
 
-        $principals = $rawList.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
-        if ($principals.Count -gt 0) {
-            $assignments[$rightId] = $principals
-        }
+        $principals = @($rawList.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+        if ($principals.Count -gt 0) { $assignments[$rightId] = $principals }
     }
-
     return $assignments
 }
 
 # ---------------------------
-# Well-known high-risk groups (language independent via SID)
+# Well-known high-risk groups (locale independent via SID)
 # ---------------------------
 $WellKnownLocalGroups = @{
     'Administrators'              = 'S-1-5-32-544'
@@ -264,8 +289,8 @@ if ($IncludeAllLocalGroups) {
         if ($hasLocalAccountsCmdlets) {
             foreach ($g in (Get-LocalGroup)) {
                 try {
-                    $members = Get-LocalGroupMember -Group $g.Name -ErrorAction Stop
-                    if (-not $members -or $members.Count -eq 0) {
+                    $members = @(Get-LocalGroupMember -Group $g.Name -ErrorAction Stop)
+                    if ($members.Count -eq 0) {
                         Add-Row -Category 'LocalGroupMember' -LocalGroup $g.Name -RightName '' -RightId '' -PrincipalRaw '' -PrincipalType '' `
                             -Source 'Get-LocalGroupMember (empty group)' -Severity '' -FindingId '' -Evidence ''
                         continue
@@ -279,15 +304,14 @@ if ($IncludeAllLocalGroups) {
                         -Source ("Get-LocalGroupMember failed: {0}" -f $_.Exception.Message) -Severity '' -FindingId '' -Evidence ''
                 }
             }
-        }
-        else {
+        } else {
             $computer = [ADSI]("WinNT://$hostname,computer")
             foreach ($child in $computer.Children) {
                 if ($child.SchemaClassName -ne 'group') { continue }
                 $groupName = $child.Name[0]
                 try {
                     $memberObjs = @($child.psbase.Invoke('Members'))
-                    if (-not $memberObjs -or $memberObjs.Count -eq 0) {
+                    if ($memberObjs.Count -eq 0) {
                         Add-Row -Category 'LocalGroupMember' -LocalGroup $groupName -RightName '' -RightId '' -PrincipalRaw '' -PrincipalType '' `
                             -Source 'ADSI (empty group)' -Severity '' -FindingId '' -Evidence ''
                         continue
@@ -304,8 +328,7 @@ if ($IncludeAllLocalGroups) {
                 }
             }
         }
-    }
-    catch {
+    } catch {
         Add-Row -Category 'Error' -LocalGroup '' -RightName '' -RightId '' -PrincipalRaw '' -PrincipalType '' `
             -Source ("Local group enumeration failed: {0}" -f $_.Exception.Message) -Severity '' -FindingId '' -Evidence ''
     }
@@ -321,10 +344,11 @@ if ($IncludeWellKnownGroups) {
             $nt = ([System.Security.Principal.SecurityIdentifier]$sid).Translate([System.Security.Principal.NTAccount]).Value
             $localGroupName = $nt.Split('\')[-1]
 
-            $members = @()
             if ($hasLocalAccountsCmdlets -and (Get-Command Get-LocalGroupMember -ErrorAction SilentlyContinue)) {
-                try { $members = Get-LocalGroupMember -Group $localGroupName -ErrorAction Stop } catch { $members = @() }
-                if (-not $members -or $members.Count -eq 0) {
+                $members = @()
+                try { $members = @(Get-LocalGroupMember -Group $localGroupName -ErrorAction Stop) } catch { $members = @() }
+
+                if ($members.Count -eq 0) {
                     Add-Row -Category 'LocalGroupMember' -LocalGroup $localGroupName -RightName '' -RightId '' -PrincipalRaw '' -PrincipalType '' `
                         -Source 'WellKnownSID (empty group)' -Severity '' -FindingId '' -Evidence ("SID={0}" -f $sid)
                 } else {
@@ -333,12 +357,11 @@ if ($IncludeWellKnownGroups) {
                             -Source 'WellKnownSID' -Severity '' -FindingId '' -Evidence ("SID={0}" -f $sid)
                     }
                 }
-            }
-            else {
+            } else {
                 try {
                     $grp = [ADSI]("WinNT://$hostname/$localGroupName,group")
                     $memberObjs = @($grp.psbase.Invoke('Members'))
-                    if (-not $memberObjs -or $memberObjs.Count -eq 0) {
+                    if ($memberObjs.Count -eq 0) {
                         Add-Row -Category 'LocalGroupMember' -LocalGroup $localGroupName -RightName '' -RightId '' -PrincipalRaw '' -PrincipalType '' `
                             -Source 'WellKnownSID+ADSI (empty group)' -Severity '' -FindingId '' -Evidence ("SID={0}" -f $sid)
                     } else {
@@ -354,8 +377,7 @@ if ($IncludeWellKnownGroups) {
                         -Source ("WellKnownSID ADSI failed: {0}" -f $_.Exception.Message) -Severity '' -FindingId '' -Evidence ("SID={0}" -f $sid)
                 }
             }
-        }
-        catch {
+        } catch {
             Add-Row -Category 'Error' -LocalGroup $friendly -RightName '' -RightId '' -PrincipalRaw '' -PrincipalType '' `
                 -Source ("WellKnownSID translate failed: {0}" -f $_.Exception.Message) -Severity '' -FindingId '' -Evidence ("SID={0}" -f $sid)
         }
@@ -366,25 +388,25 @@ if ($IncludeWellKnownGroups) {
 # 2) User Rights Assignments via secedit
 # ---------------------------
 $rightsMap = @{
-    'SeServiceLogonRight'            = 'Log on as a service'
-    'SeBatchLogonRight'              = 'Log on as a batch job'
-    'SeRemoteInteractiveLogonRight'  = 'Allow log on through Remote Desktop Services'
-    'SeInteractiveLogonRight'        = 'Log on locally'
-    'SeNetworkLogonRight'            = 'Access this computer from the network'
+    'SeServiceLogonRight'               = 'Log on as a service'
+    'SeBatchLogonRight'                 = 'Log on as a batch job'
+    'SeRemoteInteractiveLogonRight'     = 'Allow log on through Remote Desktop Services'
+    'SeInteractiveLogonRight'           = 'Log on locally'
+    'SeNetworkLogonRight'               = 'Access this computer from the network'
 
     'SeDenyRemoteInteractiveLogonRight' = 'Deny log on through Remote Desktop Services'
     'SeDenyInteractiveLogonRight'       = 'Deny log on locally'
     'SeDenyNetworkLogonRight'           = 'Deny access to this computer from the network'
 
-    'SeImpersonatePrivilege'          = 'Impersonate a client after authentication'
-    'SeAssignPrimaryTokenPrivilege'   = 'Replace a process level token'
-    'SeDebugPrivilege'                = 'Debug programs'
-    'SeBackupPrivilege'               = 'Back up files and directories'
-    'SeRestorePrivilege'              = 'Restore files and directories'
-    'SeTakeOwnershipPrivilege'        = 'Take ownership of files or other objects'
-    'SeLoadDriverPrivilege'           = 'Load and unload device drivers'
-    'SeShutdownPrivilege'             = 'Shut down the system'
-    'SeRemoteShutdownPrivilege'       = 'Force shutdown from a remote system'
+    'SeImpersonatePrivilege'            = 'Impersonate a client after authentication'
+    'SeAssignPrimaryTokenPrivilege'     = 'Replace a process level token'
+    'SeDebugPrivilege'                  = 'Debug programs'
+    'SeBackupPrivilege'                 = 'Back up files and directories'
+    'SeRestorePrivilege'                = 'Restore files and directories'
+    'SeTakeOwnershipPrivilege'          = 'Take ownership of files or other objects'
+    'SeLoadDriverPrivilege'             = 'Load and unload device drivers'
+    'SeShutdownPrivilege'               = 'Shut down the system'
+    'SeRemoteShutdownPrivilege'         = 'Force shutdown from a remote system'
 }
 
 $infPath = Join-Path $env:TEMP ("secedit_rights_{0}.inf" -f ([guid]::NewGuid().ToString('N')))
@@ -395,34 +417,30 @@ try {
     if ($exit -ne 0 -or -not (Test-Path $infPath)) {
         Add-Row -Category 'Error' -LocalGroup '' -RightName '' -RightId '' -PrincipalRaw '' -PrincipalType '' `
             -Source 'secedit.exe' -Severity '' -FindingId '' -Evidence ("secedit export failed. ExitCode={0}" -f $exit)
-    }
-    else {
+    } else {
         $lines = Get-Content -LiteralPath $infPath -Encoding Unicode -ErrorAction Stop
         $assignments = Get-UserRightsAssignments -Lines $lines
 
         foreach ($rightId in $rightsMap.Keys) {
-            $rightName = $rightsMap[$rightId]
             $principals = $assignments[$rightId]
             if (-not $principals) { continue }
 
-            foreach ($p in $principals) {
+            foreach ($p in @($principals)) {
                 $resolved = Try-TranslateToName -SidOrName $p
-                Add-Row -Category 'UserRightAssignment' -LocalGroup '' -RightName $rightName -RightId $rightId -PrincipalRaw $resolved -PrincipalType '' `
+                Add-Row -Category 'UserRightAssignment' -LocalGroup '' -RightName $rightsMap[$rightId] -RightId $rightId -PrincipalRaw $resolved -PrincipalType '' `
                     -Source 'secedit /areas USER_RIGHTS' -Severity '' -FindingId '' -Evidence ''
             }
         }
     }
-}
-catch {
+} catch {
     Add-Row -Category 'Error' -LocalGroup '' -RightName '' -RightId '' -PrincipalRaw '' -PrincipalType '' `
         -Source ("User rights export/parse failed: {0}" -f $_.Exception.Message) -Severity '' -FindingId '' -Evidence ''
-}
-finally {
+} finally {
     if (Test-Path $infPath) { Remove-Item -LiteralPath $infPath -Force -ErrorAction SilentlyContinue }
 }
 
 # ---------------------------
-# 3) Finding engine (non-local principals in high-risk local groups)
+# 3) Finding engine: non-local principals in high-risk local groups
 # ---------------------------
 $highRiskGroupsSid = @(
     'S-1-5-32-544', # Administrators
@@ -444,9 +462,9 @@ foreach ($sid in $highRiskGroupsSid) {
     $gName = Get-LocalizedLocalGroupNameFromSid $sid
     if (-not $gName) { continue }
 
-    $members = $rows | Where-Object {
+    $members = @($rows | Where-Object {
         $_.Category -eq 'LocalGroupMember' -and (Norm $_.LocalGroup) -eq (Norm $gName) -and $_.PrincipalResolved
-    }
+    })
 
     foreach ($m in $members) {
         if ($m.IsNonLocalPrincipal -eq $true) {
@@ -465,17 +483,23 @@ try {
     $rduLocalName = $rduNt.Split('\')[-1]
     $rduGroupResolvedNorm = Norm $rduNt
 
-    $rduMembers = $rows |
-        Where-Object { $_.Category -eq 'LocalGroupMember' -and (Norm $_.LocalGroup) -eq (Norm $rduLocalName) -and $_.PrincipalResolved } |
-        Select-Object -ExpandProperty PrincipalResolved -Unique
+    $rduMembers = @(
+        $rows |
+            Where-Object { $_.Category -eq 'LocalGroupMember' -and (Norm $_.LocalGroup) -eq (Norm $rduLocalName) -and $_.PrincipalResolved } |
+            Select-Object -ExpandProperty PrincipalResolved -Unique
+    )
 
-    $allowRdp = $rows |
-        Where-Object { $_.Category -eq 'UserRightAssignment' -and $_.RightId -eq 'SeRemoteInteractiveLogonRight' -and $_.PrincipalResolved } |
-        Select-Object -ExpandProperty PrincipalResolved -Unique
+    $allowRdp = @(
+        $rows |
+            Where-Object { $_.Category -eq 'UserRightAssignment' -and $_.RightId -eq 'SeRemoteInteractiveLogonRight' -and $_.PrincipalResolved } |
+            Select-Object -ExpandProperty PrincipalResolved -Unique
+    )
 
-    $denyRdp = $rows |
-        Where-Object { $_.Category -eq 'UserRightAssignment' -and $_.RightId -eq 'SeDenyRemoteInteractiveLogonRight' -and $_.PrincipalResolved } |
-        Select-Object -ExpandProperty PrincipalResolved -Unique
+    $denyRdp = @(
+        $rows |
+            Where-Object { $_.Category -eq 'UserRightAssignment' -and $_.RightId -eq 'SeDenyRemoteInteractiveLogonRight' -and $_.PrincipalResolved } |
+            Select-Object -ExpandProperty PrincipalResolved -Unique
+    )
 
     $allowSet = New-NormSet -Values $allowRdp
     $denySet  = New-NormSet -Values $denyRdp
@@ -485,7 +509,7 @@ try {
 
     Add-Row -Category 'CrossReference' -LocalGroup $rduLocalName -RightName $rightsMap['SeRemoteInteractiveLogonRight'] -RightId 'SeRemoteInteractiveLogonRight' `
         -PrincipalRaw $rduNt -PrincipalType 'Group' -Source 'CrossRefSummary' -Severity '' -FindingId '' `
-        -Evidence ("AllowGroupCovered={0}; DenyGroupCovered={1}; Members={2}" -f $allowGroupCovered, $denyGroupCovered, ($rduMembers.Count))
+        -Evidence ("AllowGroupCovered={0}; DenyGroupCovered={1}; Members={2}" -f $allowGroupCovered, $denyGroupCovered, $rduMembers.Count)
 
     if ($denyGroupCovered) {
         Add-Finding -Severity 'High' -FindingId 'RDPDenyAppliedToRemoteDesktopUsersGroup' `
@@ -509,11 +533,10 @@ try {
         }
     }
 
-    if (-not $rduMembers -or $rduMembers.Count -eq 0) {
+    if ($rduMembers.Count -eq 0) {
         Add-Finding -Severity 'Info' -FindingId 'RemoteDesktopUsersGroupEmpty' -Evidence ("Group={0} appears empty on host" -f $rduLocalName)
     }
-}
-catch {
+} catch {
     Add-Row -Category 'Error' -LocalGroup 'Remote Desktop Users' -RightName '' -RightId '' -PrincipalRaw '' -PrincipalType '' `
         -Source ("Cross-reference failed: {0}" -f $_.Exception.Message) -Severity '' -FindingId '' -Evidence ''
 }
@@ -535,7 +558,7 @@ $highRiskRights = @(
 )
 
 foreach ($rid in $highRiskRights) {
-    $entries = $rows | Where-Object { $_.Category -eq 'UserRightAssignment' -and $_.RightId -eq $rid -and $_.PrincipalResolved }
+    $entries = @($rows | Where-Object { $_.Category -eq 'UserRightAssignment' -and $_.RightId -eq $rid -and $_.PrincipalResolved })
     foreach ($e in $entries) {
         if ($e.IsNonLocalPrincipal -eq $true -or $e.IsDomainSid -eq $true -or $e.IsDomainLikeName -eq $true) {
             Add-Finding -Severity 'Medium' -FindingId 'NonLocalPrincipalAssignedToUserRight' `
@@ -545,12 +568,58 @@ foreach ($rid in $highRiskRights) {
 }
 
 # ---------------------------
-# Output CSV to console ONLY
+# Summary
 # ---------------------------
-$rows |
-    Select-Object Hostname, Category, LocalGroup, RightName, RightId,
-        PrincipalRaw, PrincipalResolved, PrincipalSid, PrincipalType,
-        IsNonLocalPrincipal, IsDomainSid, IsDomainLikeName, IsGroupHint,
-        Severity, FindingId, Evidence, Source |
-    ConvertTo-Csv -NoTypeInformation -Delimiter $Delimiter |
-    ForEach-Object { Write-Output $_ }
+$findingRows = @($rows | Where-Object { $_.Category -eq 'Finding' })
+$errorRows   = @($rows | Where-Object { $_.Category -eq 'Error' })
+
+$summary = [pscustomobject]@{
+    rowsTotal      = $rows.Count
+    findingsTotal  = $findingRows.Count
+    errorsTotal    = $errorRows.Count
+    highFindings   = (@($findingRows | Where-Object { $_.Severity -eq 'High' })).Count
+    mediumFindings = (@($findingRows | Where-Object { $_.Severity -eq 'Medium' })).Count
+    infoFindings   = (@($findingRows | Where-Object { $_.Severity -eq 'Info' })).Count
+}
+
+# ---------------------------
+# Output JSON (chunked for wrap-robust bulk download)
+# ---------------------------
+$rowsForJson = $rows | ForEach-Object {
+    [pscustomobject]@{
+        Hostname            = $_.Hostname
+        Domain              = $_.Domain
+        Category            = $_.Category
+
+        LocalGroup          = To-ChunkOrScalar -Value $_.LocalGroup -Threshold $ChunkThreshold -ChunkSizeLocal $ChunkSize
+        RightName           = To-ChunkOrScalar -Value $_.RightName -Threshold $ChunkThreshold -ChunkSizeLocal $ChunkSize
+        RightId             = $_.RightId
+
+        PrincipalRaw        = To-ChunkOrScalar -Value $_.PrincipalRaw -Threshold $ChunkThreshold -ChunkSizeLocal $ChunkSize
+        PrincipalResolved   = To-ChunkOrScalar -Value $_.PrincipalResolved -Threshold $ChunkThreshold -ChunkSizeLocal $ChunkSize
+        PrincipalSid        = To-ChunkOrScalar -Value $_.PrincipalSid -Threshold $ChunkThreshold -ChunkSizeLocal $ChunkSize
+        PrincipalType       = $_.PrincipalType
+
+        IsNonLocalPrincipal = $_.IsNonLocalPrincipal
+        IsDomainSid         = $_.IsDomainSid
+        IsDomainLikeName    = $_.IsDomainLikeName
+        IsGroupHint         = $_.IsGroupHint
+
+        Severity            = $_.Severity
+        FindingId           = To-ChunkOrScalar -Value $_.FindingId -Threshold $ChunkThreshold -ChunkSizeLocal $ChunkSize
+        Evidence            = To-ChunkOrScalar -Value $_.Evidence -Threshold $ChunkThreshold -ChunkSizeLocal $ChunkSize
+        Source              = To-ChunkOrScalar -Value $_.Source -Threshold $ChunkThreshold -ChunkSizeLocal $ChunkSize
+    }
+}
+
+$payload = [pscustomobject]@{
+    schema            = 'LocalRightsAuditChunkedJsonV1'
+    generatedUtc      = ([DateTime]::UtcNow.ToString('o'))
+    hostname          = $hostname
+    domainOrWorkgroup = $machineDomain
+    summary           = $summary
+    rows              = $rowsForJson
+}
+
+# Pretty JSON (multiline). Chunking keeps tokens short; bulk download can be parsed reliably.
+$payload | ConvertTo-Json -Depth 8
