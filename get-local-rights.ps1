@@ -1,8 +1,5 @@
-#requires -version 5.1
 <#
 .SYNOPSIS
-  Tanium Sensor-ready Local Rights Audit (STDOUT JSON, bulk-download friendly)
-
   Collects (READ-ONLY):
     - Local group memberships (all groups) + explicit well-known high-risk groups (SID-based, locale independent)
     - User Rights Assignments via secedit USER_RIGHTS
