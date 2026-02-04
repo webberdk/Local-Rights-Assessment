@@ -12,29 +12,15 @@
         * RemoteDesktopUsersGroupEmpty
 
   Output:
-    - JSON to STDOUT (pretty / multiline) with chunking for long strings to avoid mid-token breaks in Tanium UI/export.
-    - Structure:
-        {
-          "schema":"LocalRightsAuditChunkedJsonV1",
-          "generatedUtc":"...",
-          "hostname":"...",
-          "domainOrWorkgroup":"...",
-          "summary":{...},
-          "rows":[ ... ]
-        }
+    - CSV to STDOUT (includes a header row).
 
 .NOTES
   - Designed for Tanium Sensor running across many endpoints and bulk downloading results.
-  - Chunking: long strings are emitted as arrays of short strings. Parser can join arrays back to strings.
   - No file writes; all output to STDOUT.
 #>
 
 [CmdletBinding()]
 param(
-    # Chunk long strings to avoid mid-token breaks when Tanium wraps/exports.
-    [int]$ChunkSize = 48,
-    [int]$ChunkThreshold = 60,
-
     [bool]$IncludeAllLocalGroups = $true,
     [bool]$IncludeWellKnownGroups = $true
 )
@@ -68,31 +54,6 @@ function New-NormSet {
         foreach ($val in $Values) { $null = $set.Add((Norm $val)) }
     }
     return $set
-}
-
-function Split-Chunk {
-    param(
-        [AllowNull()][string]$Value,
-        [int]$ChunkSizeLocal
-    )
-    if ([string]::IsNullOrEmpty($Value)) { return @() }
-    $chunks = New-Object 'System.Collections.Generic.List[string]'
-    for ($i = 0; $i -lt $Value.Length; $i += $ChunkSizeLocal) {
-        $len = [Math]::Min($ChunkSizeLocal, $Value.Length - $i)
-        $chunks.Add($Value.Substring($i, $len))
-    }
-    return ,$chunks.ToArray()
-}
-
-function To-ChunkOrScalar {
-    param(
-        [AllowNull()][string]$Value,
-        [int]$Threshold,
-        [int]$ChunkSizeLocal
-    )
-    if ([string]::IsNullOrEmpty($Value)) { return '' }
-    if ($Value.Length -ge $Threshold) { return (Split-Chunk -Value $Value -ChunkSizeLocal $ChunkSizeLocal) }
-    return $Value
 }
 
 function Try-TranslateToSid {
@@ -565,58 +526,12 @@ foreach ($rid in $highRiskRights) {
 }
 
 # ---------------------------
-# Summary
+# Output CSV to STDOUT
 # ---------------------------
-$findingRows = @($rows | Where-Object { $_.Category -eq 'Finding' })
-$errorRows   = @($rows | Where-Object { $_.Category -eq 'Error' })
-
-$summary = [pscustomobject]@{
-    rowsTotal      = $rows.Count
-    findingsTotal  = $findingRows.Count
-    errorsTotal    = $errorRows.Count
-    highFindings   = (@($findingRows | Where-Object { $_.Severity -eq 'High' })).Count
-    mediumFindings = (@($findingRows | Where-Object { $_.Severity -eq 'Medium' })).Count
-    infoFindings   = (@($findingRows | Where-Object { $_.Severity -eq 'Info' })).Count
-}
-
-# ---------------------------
-# Output JSON (chunked for wrap-robust bulk download)
-# ---------------------------
-$rowsForJson = $rows | ForEach-Object {
-    [pscustomobject]@{
-        Hostname            = $_.Hostname
-        Domain              = $_.Domain
-        Category            = $_.Category
-
-        LocalGroup          = To-ChunkOrScalar -Value $_.LocalGroup -Threshold $ChunkThreshold -ChunkSizeLocal $ChunkSize
-        RightName           = To-ChunkOrScalar -Value $_.RightName -Threshold $ChunkThreshold -ChunkSizeLocal $ChunkSize
-        RightId             = $_.RightId
-
-        PrincipalRaw        = To-ChunkOrScalar -Value $_.PrincipalRaw -Threshold $ChunkThreshold -ChunkSizeLocal $ChunkSize
-        PrincipalResolved   = To-ChunkOrScalar -Value $_.PrincipalResolved -Threshold $ChunkThreshold -ChunkSizeLocal $ChunkSize
-        PrincipalSid        = To-ChunkOrScalar -Value $_.PrincipalSid -Threshold $ChunkThreshold -ChunkSizeLocal $ChunkSize
-        PrincipalType       = $_.PrincipalType
-
-        IsNonLocalPrincipal = $_.IsNonLocalPrincipal
-        IsDomainSid         = $_.IsDomainSid
-        IsDomainLikeName    = $_.IsDomainLikeName
-        IsGroupHint         = $_.IsGroupHint
-
-        Severity            = $_.Severity
-        FindingId           = To-ChunkOrScalar -Value $_.FindingId -Threshold $ChunkThreshold -ChunkSizeLocal $ChunkSize
-        Evidence            = To-ChunkOrScalar -Value $_.Evidence -Threshold $ChunkThreshold -ChunkSizeLocal $ChunkSize
-        Source              = To-ChunkOrScalar -Value $_.Source -Threshold $ChunkThreshold -ChunkSizeLocal $ChunkSize
-    }
-}
-
-$payload = [pscustomobject]@{
-    schema            = 'LocalRightsAuditChunkedJsonV1'
-    generatedUtc      = ([DateTime]::UtcNow.ToString('o'))
-    hostname          = $hostname
-    domainOrWorkgroup = $machineDomain
-    summary           = $summary
-    rows              = $rowsForJson
-}
-
-# Pretty JSON (multiline). Chunking keeps tokens short; bulk download can be parsed reliably.
-$payload | ConvertTo-Json -Depth 8
+$rows |
+    Select-Object `
+        Hostname, Domain, Category, LocalGroup, RightName, RightId, `
+        PrincipalRaw, PrincipalResolved, PrincipalSid, PrincipalType, `
+        IsNonLocalPrincipal, IsDomainSid, IsDomainLikeName, IsGroupHint, `
+        Severity, FindingId, Evidence, Source |
+    ConvertTo-Csv -NoTypeInformation

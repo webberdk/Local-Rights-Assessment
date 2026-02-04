@@ -1,15 +1,14 @@
 # Local-Rights-Assessment
 
-Collect and review local rights assignments and local group membership on Windows endpoints, then optionally merge the JSON output into a single CSV for analysis.
+Collect and review local rights assignments and local group membership on Windows endpoints, emitting CSV for analysis.
 
 ## Included scripts
 
-- `get-local-rights.ps1`: Runs on a Windows host and emits a JSON payload to STDOUT containing:
+- `get-local-rights.ps1`: Runs on a Windows host and emits CSV to STDOUT containing:
   - Local group memberships for all groups plus well-known high‑risk groups (SID-based, locale-independent).
   - User Rights Assignments via `secedit`.
   - Cross‑checks and findings such as non-local principals in high‑risk groups or denied RDP access.
-  - A chunked JSON format to avoid long-string truncation in Tanium exports.
-- `Merge-LocalRightsAuditJsonToCsv.ps1`: Merges one or more JSON outputs (for example, Tanium bulk downloads) into a single CSV file.
+- `Merge-LocalRightsAuditJsonToCsv.ps1`: Merges one or more JSON outputs from earlier versions (for example, Tanium bulk downloads) into a single CSV file.
 
 ## Requirements
 
@@ -18,14 +17,14 @@ Collect and review local rights assignments and local group membership on Window
 
 ## Usage
 
-### Collect local rights (JSON)
+### Collect local rights (CSV)
 
 ```powershell
-# Run locally and write JSON to a file
-./get-local-rights.ps1 | Out-File -FilePath .\local-rights.json -Encoding utf8
+# Run locally and write CSV to a file
+./get-local-rights.ps1 | Out-File -FilePath .\local-rights.csv -Encoding utf8
 
 # Optional parameters
-./get-local-rights.ps1 -ChunkSize 48 -ChunkThreshold 60 -IncludeAllLocalGroups $true -IncludeWellKnownGroups $true
+./get-local-rights.ps1 -IncludeAllLocalGroups $true -IncludeWellKnownGroups $true
 ```
 
 ### Merge JSON into CSV
@@ -40,9 +39,9 @@ Collect and review local rights assignments and local group membership on Window
 
 ## Output format (high level)
 
-The JSON payload includes a `summary` section plus a `rows` array of findings and membership entries. Long strings may be returned as arrays of short strings (chunked) to keep exports safe; the merge script re-joins these values.
+The CSV output includes one row per finding or membership entry, with columns such as host, domain, category, local group, right name/id, principal details, and evidence.
 
 ## Notes
 
 - The collection script is read‑only and does not write files.
-- The merge script expects valid JSON files from the collection script and will stop on errors unless `-ContinueOnError` is set.
+- The merge script expects valid JSON files from the previous collection script version and will stop on errors unless `-ContinueOnError` is set.
