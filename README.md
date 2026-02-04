@@ -1,4 +1,4 @@
-# Get-current-rights
+# Local-Rights-Assessment
 
 Collect and review local rights assignments and local group membership on Windows endpoints, then optionally merge the JSON output into a single CSV for analysis.
 
